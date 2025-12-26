@@ -1,0 +1,164 @@
+name: Generate JSON Schema
+
+on:
+  push:
+    branches:
+      - main
+      - master
+    tags:
+      - 'v*'  # 当推送以 v 开头的 tag 时触发
+  pull_request:
+    branches:
+      - main
+      - master
+  workflow_dispatch: # 允许手动触发
+
+jobs:
+  generate-schema:
+    runs-on: ubuntu-latest
+    outputs:
+      schema-changed: ${{ steps.verify-changed-files.outputs.changed }}
+      version: ${{ steps.get-version.outputs.version }}
+
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # 获取完整历史用于生成版本号
+
+      - name: 设置 Go 环境
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.21'
+
+      - name: 下载依赖
+        run: go mod download
+
+      - name: 验证依赖
+        run: go mod verify
+
+      - name: 生成 JSON Schema
+        run: go run main.go
+
+      - name: 获取版本号
+        id: get-version
+        run: |
+          if [[ "${{ github.ref }}" == refs/tags/* ]]; then
+            VERSION=${GITHUB_REF#refs/tags/}
+          else
+            VERSION=$(git describe --tags --always --dirty 2>/dev/null || echo "dev-$(git rev-parse --short HEAD)")
+          fi
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "Version: $VERSION"
+
+      - name: 检查是否有变更
+        id: verify-changed-files
+        run: |
+          if [ -n "$(git status --porcelain sing-box-config-schema.json)" ]; then
+            echo "changed=true" >> $GITHUB_OUTPUT
+          else
+            echo "changed=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: 提交更改
+        if: steps.verify-changed-files.outputs.changed == 'true' && github.event_name != 'pull_request' && !startsWith(github.ref, 'refs/tags/')
+        run: |
+          git config --global user.name 'github-actions[bot]'
+          git config --global user.email 'github-actions[bot]@users.noreply.github.com'
+          git add sing-box-config-schema.json
+          git commit -m 'chore: 自动生成 sing-box 配置的 JSON Schema'
+          git push
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: 上传 Schema 文件
+        uses: actions/upload-artifact@v4
+        with:
+          name: sing-box-config-schema
+          path: sing-box-config-schema.json
+          retention-days: 30
+
+  release:
+    needs: generate-schema
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/') && github.event_name == 'push'
+    permissions:
+      contents: write
+
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 下载 Schema 文件
+        uses: actions/download-artifact@v4
+        with:
+          name: sing-box-config-schema
+          path: .
+
+      - name: 获取版本号
+        id: get-version
+        run: |
+          VERSION=${GITHUB_REF#refs/tags/}
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "Release version: $VERSION"
+
+      - name: 创建 Release
+        uses: softprops/action-gh-release@v1
+        with:
+          files: sing-box-config-schema.json
+          name: Release ${{ steps.get-version.outputs.version }}
+          body: |
+            ## sing-box JSON Schema ${{ steps.get-version.outputs.version }}
+
+            自动生成的 sing-box 配置文件 JSON Schema。
+
+            ### 下载
+            - [sing-box-config-schema.json](https://github.com/${{ github.repository }}/releases/download/${{ steps.get-version.outputs.version }}/sing-box-config-schema.json)
+
+            ### 在线查看
+            - [GitHub Pages](https://${{ github.repository_owner }}.github.io/${{ github.event.repository.name }}/sing-box-config-schema.json)
+          draft: false
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  deploy-pages:
+    needs: generate-schema
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master' || startsWith(github.ref, 'refs/tags/'))
+    permissions:
+      contents: read
+      pages: write
+      id-token: write
+
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 下载 Schema 文件
+        uses: actions/download-artifact@v4
+        with:
+          name: sing-box-config-schema
+          path: .
+
+      - name: 设置 Pages
+        uses: actions/configure-pages@v4
+
+      - name: 创建 HTML 页面
+        run: |
+          mkdir -p _site
+          cp sing-box-config-schema.json _site/
+          
+          # 使用 sed 替换变量
+          REPO_OWNER="${{ github.repository_owner }}"
+          REPO_NAME="${{ github.event.repository.name }}"
+          REPO_FULL="${{ github.repository }}"
+          
+          sed -e "s|REPO_OWNER|$REPO_OWNER|g" \
+              -e "s|REPO_NAME|$REPO_NAME|g" \
+              -e "s|REPO_FULL|$REPO_FULL|g" \
+              docs/index.html > _site/index.html
+
+      - name: 部署到 GitHub Pages
+        uses: actions/deploy-pages@v4
+
