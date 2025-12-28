@@ -2,22 +2,14 @@ name: Generate JSON Schema
 
 on:
   push:
-    branches:
-      - main
-      - master
     tags:
-      - 'v*'  # 当推送以 v 开头的 tag 时触发
-  pull_request:
-    branches:
-      - main
-      - master
+      - 'v*'  # 只在推送以 v 开头的 tag 时触发
   workflow_dispatch: # 允许手动触发
 
 jobs:
   generate-schema:
     runs-on: ubuntu-latest
     outputs:
-      schema-changed: ${{ steps.verify-changed-files.outputs.changed }}
       version: ${{ steps.get-version.outputs.version }}
 
     steps:
@@ -43,33 +35,9 @@ jobs:
       - name: 获取版本号
         id: get-version
         run: |
-          if [[ "${{ github.ref }}" == refs/tags/* ]]; then
-            VERSION=${GITHUB_REF#refs/tags/}
-          else
-            VERSION=$(git describe --tags --always --dirty 2>/dev/null || echo "dev-$(git rev-parse --short HEAD)")
-          fi
+          VERSION=${GITHUB_REF#refs/tags/}
           echo "version=$VERSION" >> $GITHUB_OUTPUT
           echo "Version: $VERSION"
-
-      - name: 检查是否有变更
-        id: verify-changed-files
-        run: |
-          if [ -n "$(git status --porcelain sing-box-config-schema.json)" ]; then
-            echo "changed=true" >> $GITHUB_OUTPUT
-          else
-            echo "changed=false" >> $GITHUB_OUTPUT
-          fi
-
-      - name: 提交更改
-        if: steps.verify-changed-files.outputs.changed == 'true' && github.event_name != 'pull_request' && !startsWith(github.ref, 'refs/tags/')
-        run: |
-          git config --global user.name 'github-actions[bot]'
-          git config --global user.email 'github-actions[bot]@users.noreply.github.com'
-          git add sing-box-config-schema.json
-          git commit -m 'chore: 自动生成 sing-box 配置的 JSON Schema'
-          git push
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: 上传 Schema 文件
         uses: actions/upload-artifact@v4
@@ -81,7 +49,7 @@ jobs:
   release:
     needs: generate-schema
     runs-on: ubuntu-latest
-    if: startsWith(github.ref, 'refs/tags/') && github.event_name == 'push'
+    if: startsWith(github.ref, 'refs/tags/')
     permissions:
       contents: write
 
@@ -125,7 +93,7 @@ jobs:
   deploy-pages:
     needs: generate-schema
     runs-on: ubuntu-latest
-    if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master' || startsWith(github.ref, 'refs/tags/'))
+    if: startsWith(github.ref, 'refs/tags/')
     permissions:
       contents: read
       pages: write
