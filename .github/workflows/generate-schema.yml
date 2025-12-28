@@ -159,6 +159,12 @@ jobs:
               -e "s|REPO_FULL|$REPO_FULL|g" \
               docs/index.html > _site/index.html
 
+      - name: 上传 Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: _site
+
       - name: 部署到 GitHub Pages
+        id: deployment
         uses: actions/deploy-pages@v4
 
