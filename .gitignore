@@ -22,3 +22,4 @@ go.work
 Thumbs.db
 
 temp/
+sing-box-config-schema.json
