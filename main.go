@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"reflect"
+	"slices"
 	"strings"
 
 	"github.com/invopop/jsonschema"
@@ -25,72 +26,72 @@ func main() {
 	// 首先生成所有类型的 schema 定义
 	baseSchema := reflector.Reflect(&option.Options{})
 
-	// 手动为 Inbound 生成完整的 oneOf schema
-	inboundSchema := generateInboundSchema(&reflector)
-	if len(inboundSchema) > 0 {
-		// 更新 inbounds 数组项的 schema
+	// 确保顶层 $defs 存在
+	if baseSchema.Definitions == nil {
+		baseSchema.Definitions = make(jsonschema.Definitions)
+	}
+
+	// 1. 先注册所有 Inbound 类型到顶层 $defs，然后生成 oneOf 引用
+	inboundOneOf := registerAndGenerateOneOf(&reflector, baseSchema.Definitions, "inbound")
+	if len(inboundOneOf) > 0 {
 		if inboundsProp, ok := baseSchema.Properties.Get("inbounds"); ok && inboundsProp != nil {
 			if inboundsProp.Items != nil {
-				itemsSchema := inboundsProp.Items
-				itemsSchema.OneOf = inboundSchema
+				inboundsProp.Items.OneOf = inboundOneOf
+				inboundsProp.Items.Ref = "" // 清除原来的 $ref
 			}
 		}
 	}
 
-	// 手动为 Outbound 生成完整的 oneOf schema
-	outboundSchema := generateOutboundSchema(&reflector)
-	if len(outboundSchema) > 0 {
-		// 更新 outbounds 数组项的 schema
+	// 2. 注册所有 Outbound 类型到顶层 $defs，然后生成 oneOf 引用
+	outboundOneOf := registerAndGenerateOneOf(&reflector, baseSchema.Definitions, "outbound")
+	if len(outboundOneOf) > 0 {
 		if outboundsProp, ok := baseSchema.Properties.Get("outbounds"); ok && outboundsProp != nil {
 			if outboundsProp.Items != nil {
-				itemsSchema := outboundsProp.Items
-				itemsSchema.OneOf = outboundSchema
+				outboundsProp.Items.OneOf = outboundOneOf
+				outboundsProp.Items.Ref = "" // 清除原来的 $ref
 			}
 		}
 	}
 
-	// 手动为 Rule 生成完整的 oneOf schema
-	ruleSchema := generateRuleSchema(&reflector)
-	if len(ruleSchema) > 0 {
-		// 更新 route.rules 数组项的 schema
+	// 3. 注册 Rule 类型
+	ruleOneOf := registerRuleTypes(&reflector, baseSchema.Definitions)
+	if len(ruleOneOf) > 0 {
 		if routeProp, ok := baseSchema.Properties.Get("route"); ok && routeProp != nil {
 			if routeProp.Properties != nil {
 				if rulesProp, ok := routeProp.Properties.Get("rules"); ok && rulesProp != nil {
 					if rulesProp.Items != nil {
-						itemsSchema := rulesProp.Items
-						itemsSchema.OneOf = ruleSchema
+						rulesProp.Items.OneOf = ruleOneOf
+						rulesProp.Items.Ref = ""
 					}
 				}
 			}
 		}
 	}
 
-	// 手动为 RuleSet 生成完整的 oneOf schema
-	ruleSetSchema := generateRuleSetSchema(&reflector)
-	if len(ruleSetSchema) > 0 {
-		// 更新 route.rule_set 数组项的 schema
+	// 4. 注册 RuleSet 类型
+	ruleSetOneOf := registerRuleSetTypes(&reflector, baseSchema.Definitions)
+	if len(ruleSetOneOf) > 0 {
 		if routeProp, ok := baseSchema.Properties.Get("route"); ok && routeProp != nil {
 			if routeProp.Properties != nil {
 				if ruleSetProp, ok := routeProp.Properties.Get("rule_set"); ok && ruleSetProp != nil {
 					if ruleSetProp.Items != nil {
-						itemsSchema := ruleSetProp.Items
-						itemsSchema.OneOf = ruleSetSchema
+						ruleSetProp.Items.OneOf = ruleSetOneOf
+						ruleSetProp.Items.Ref = ""
 					}
 				}
 			}
 		}
 	}
 
-	// 手动为 DNSRule 生成完整的 oneOf schema
-	dnsRuleSchema := generateDNSRuleSchema(&reflector)
-	if len(dnsRuleSchema) > 0 {
-		// 更新 dns.rules 数组项的 schema
+	// 5. 注册 DNSRule 类型
+	dnsRuleOneOf := registerDNSRuleTypes(&reflector, baseSchema.Definitions)
+	if len(dnsRuleOneOf) > 0 {
 		if dnsProp, ok := baseSchema.Properties.Get("dns"); ok && dnsProp != nil {
 			if dnsProp.Properties != nil {
 				if dnsRulesProp, ok := dnsProp.Properties.Get("rules"); ok && dnsRulesProp != nil {
 					if dnsRulesProp.Items != nil {
-						itemsSchema := dnsRulesProp.Items
-						itemsSchema.OneOf = dnsRuleSchema
+						dnsRulesProp.Items.OneOf = dnsRuleOneOf
+						dnsRulesProp.Items.Ref = ""
 					}
 				}
 			}
@@ -102,8 +103,11 @@ func main() {
 	baseSchema.Title = "sing-box Configuration Schema"
 	baseSchema.Description = "JSON Schema for sing-box configuration file"
 
-	// 更新所有 $defs 中的 $id，使其指向我们的 GitHub Pages
-	updateSchemaIDs(baseSchema, "https://kenxx.github.io/sing-box.json")
+	// 清理：移除所有嵌套的 $defs（已经合并到顶层）
+	cleanupNestedDefs(baseSchema)
+
+	// 规范化 $defs 名称（移除特殊字符如 [], /）
+	normalizeDefNames(baseSchema)
 
 	// 将 Schema 转换为 JSON 格式
 	schemaJSON, err := json.MarshalIndent(baseSchema, "", "  ")
@@ -123,66 +127,446 @@ func main() {
 	fmt.Printf("JSON Schema generated successfully: %s\n", outputFile)
 }
 
-// generateInboundSchema 为所有 inbound 类型生成 oneOf schema
-func generateInboundSchema(reflector *jsonschema.Reflector) []*jsonschema.Schema {
-	var schemas []*jsonschema.Schema
+// registerAndGenerateOneOf 注册所有类型到顶层 $defs，返回 oneOf 引用数组
+func registerAndGenerateOneOf(reflector *jsonschema.Reflector, defs jsonschema.Definitions, category string) []*jsonschema.Schema {
+	var oneOfSchemas []*jsonschema.Schema
 
-	// 使用反射动态获取类型映射关系
-	typeMapping := getInboundTypeMapping()
+	var typeMapping map[string]string
+	var structType reflect.Type
 
-	// 使用反射获取 _Inbound 结构体的所有字段
-	inboundStructType := reflect.TypeOf((*option.Inbound)(nil)).Elem()
+	switch category {
+	case "inbound":
+		typeMapping = getInboundTypeMapping()
+		structType = reflect.TypeOf((*option.Inbound)(nil)).Elem()
+	case "outbound":
+		typeMapping = getOutboundTypeMapping()
+		structType = reflect.TypeOf((*option.Outbound)(nil)).Elem()
+	default:
+		return nil
+	}
 
-	// 遍历所有字段（跳过 Type 和 Tag）
-	for i := 0; i < inboundStructType.NumField(); i++ {
-		field := inboundStructType.Field(i)
+	// 遍历所有字段
+	for i := 0; i < structType.NumField(); i++ {
+		field := structType.Field(i)
 		fieldName := field.Name
 
-		// 跳过 Type 和 Tag 字段
 		if fieldName == "Type" || fieldName == "Tag" {
 			continue
 		}
 
-		// 获取类型名称（通过动态映射）
 		typeName, ok := typeMapping[fieldName]
 		if !ok {
 			continue
 		}
 
-		// 获取字段的类型
+		// 生成定义名称，如 "HTTPInboundOptions"
+		defName := fieldName
+		if !strings.HasSuffix(defName, "Options") {
+			defName = fieldName + "Options"
+		}
+
+		// 创建该类型的零值实例并生成 schema
 		fieldType := field.Type
-
-		// 创建该类型的零值实例
 		fieldValue := reflect.New(fieldType).Interface()
-
-		// 生成 schema
 		typeSchema := reflector.Reflect(fieldValue)
-		// 添加 type 字段的约束
+
+		// 添加 type 字段约束
 		typeSchema.Properties.Set("type", &jsonschema.Schema{
 			Type:    "string",
 			Const:   typeName,
 			Default: typeName,
 		})
+
 		// 确保 type 是必需的
-		if typeSchema.Required == nil {
-			typeSchema.Required = []string{"type"}
-		} else {
-			// 检查是否已包含 type
-			hasType := false
-			for _, req := range typeSchema.Required {
-				if req == "type" {
-					hasType = true
-					break
+		if !slices.Contains(typeSchema.Required, "type") {
+			typeSchema.Required = append(typeSchema.Required, "type")
+		}
+
+		// 清理 schema 的元数据（$id, $schema）
+		typeSchema.ID = ""
+		typeSchema.Version = ""
+
+		// 将子 schema 的 $defs 合并到顶层
+		if typeSchema.Definitions != nil {
+			for name, def := range typeSchema.Definitions {
+				if _, exists := defs[name]; !exists {
+					defs[name] = def
 				}
 			}
-			if !hasType {
-				typeSchema.Required = append(typeSchema.Required, "type")
-			}
+			typeSchema.Definitions = nil
 		}
-		schemas = append(schemas, typeSchema)
+
+		// 注册到顶层 $defs
+		defs[defName] = typeSchema
+
+		// 创建 oneOf 引用
+		oneOfSchemas = append(oneOfSchemas, &jsonschema.Schema{
+			Ref: "#/$defs/" + defName,
+		})
 	}
 
-	return schemas
+	return oneOfSchemas
+}
+
+// registerRuleTypes 注册 Rule 类型
+func registerRuleTypes(reflector *jsonschema.Reflector, defs jsonschema.Definitions) []*jsonschema.Schema {
+	var oneOfSchemas []*jsonschema.Schema
+
+	ruleTypes := []struct {
+		typeName string
+		defName  string
+		options  interface{}
+	}{
+		{constant.RuleTypeDefault, "DefaultRule", &option.DefaultRule{}},
+		{constant.RuleTypeLogical, "LogicalRule", &option.LogicalRule{}},
+	}
+
+	for _, ruleType := range ruleTypes {
+		typeSchema := reflector.Reflect(ruleType.options)
+
+		// 添加 type 字段约束
+		if ruleType.typeName == constant.RuleTypeDefault {
+			typeSchema.Properties.Set("type", &jsonschema.Schema{
+				Type: "string",
+				Enum: []interface{}{"", constant.RuleTypeDefault},
+			})
+		} else {
+			typeSchema.Properties.Set("type", &jsonschema.Schema{
+				Type:    "string",
+				Const:   ruleType.typeName,
+				Default: ruleType.typeName,
+			})
+		}
+
+		// 清理元数据
+		typeSchema.ID = ""
+		typeSchema.Version = ""
+
+		// 合并子 $defs
+		if typeSchema.Definitions != nil {
+			for name, def := range typeSchema.Definitions {
+				if _, exists := defs[name]; !exists {
+					defs[name] = def
+				}
+			}
+			typeSchema.Definitions = nil
+		}
+
+		defs[ruleType.defName] = typeSchema
+		oneOfSchemas = append(oneOfSchemas, &jsonschema.Schema{
+			Ref: "#/$defs/" + ruleType.defName,
+		})
+	}
+
+	return oneOfSchemas
+}
+
+// registerRuleSetTypes 注册 RuleSet 类型
+func registerRuleSetTypes(reflector *jsonschema.Reflector, defs jsonschema.Definitions) []*jsonschema.Schema {
+	var oneOfSchemas []*jsonschema.Schema
+
+	ruleSetTypes := []struct {
+		typeName string
+		defName  string
+		options  interface{}
+	}{
+		{constant.RuleSetTypeLocal, "LocalRuleSet", &option.LocalRuleSet{}},
+		{constant.RuleSetTypeRemote, "RemoteRuleSet", &option.RemoteRuleSet{}},
+	}
+
+	for _, ruleSetType := range ruleSetTypes {
+		typeSchema := reflector.Reflect(ruleSetType.options)
+
+		typeSchema.Properties.Set("type", &jsonschema.Schema{
+			Type:    "string",
+			Const:   ruleSetType.typeName,
+			Default: ruleSetType.typeName,
+		})
+
+		// 确保 type, tag, format 是必需的
+		requiredFields := []string{"type", "tag", "format"}
+		for _, field := range requiredFields {
+			if !slices.Contains(typeSchema.Required, field) {
+				typeSchema.Required = append(typeSchema.Required, field)
+			}
+		}
+
+		// 清理元数据
+		typeSchema.ID = ""
+		typeSchema.Version = ""
+
+		// 合并子 $defs
+		if typeSchema.Definitions != nil {
+			for name, def := range typeSchema.Definitions {
+				if _, exists := defs[name]; !exists {
+					defs[name] = def
+				}
+			}
+			typeSchema.Definitions = nil
+		}
+
+		defs[ruleSetType.defName] = typeSchema
+		oneOfSchemas = append(oneOfSchemas, &jsonschema.Schema{
+			Ref: "#/$defs/" + ruleSetType.defName,
+		})
+	}
+
+	return oneOfSchemas
+}
+
+// registerDNSRuleTypes 注册 DNSRule 类型
+func registerDNSRuleTypes(reflector *jsonschema.Reflector, defs jsonschema.Definitions) []*jsonschema.Schema {
+	var oneOfSchemas []*jsonschema.Schema
+
+	dnsRuleTypes := []struct {
+		typeName string
+		defName  string
+		options  interface{}
+	}{
+		{constant.RuleTypeDefault, "DefaultDNSRule", &option.DefaultDNSRule{}},
+		{constant.RuleTypeLogical, "LogicalDNSRule", &option.LogicalDNSRule{}},
+	}
+
+	for _, dnsRuleType := range dnsRuleTypes {
+		typeSchema := reflector.Reflect(dnsRuleType.options)
+
+		if dnsRuleType.typeName == constant.RuleTypeDefault {
+			typeSchema.Properties.Set("type", &jsonschema.Schema{
+				Type: "string",
+				Enum: []interface{}{"", constant.RuleTypeDefault},
+			})
+		} else {
+			typeSchema.Properties.Set("type", &jsonschema.Schema{
+				Type:    "string",
+				Const:   dnsRuleType.typeName,
+				Default: dnsRuleType.typeName,
+			})
+		}
+
+		// 清理元数据
+		typeSchema.ID = ""
+		typeSchema.Version = ""
+
+		// 合并子 $defs
+		if typeSchema.Definitions != nil {
+			for name, def := range typeSchema.Definitions {
+				if _, exists := defs[name]; !exists {
+					defs[name] = def
+				}
+			}
+			typeSchema.Definitions = nil
+		}
+
+		defs[dnsRuleType.defName] = typeSchema
+		oneOfSchemas = append(oneOfSchemas, &jsonschema.Schema{
+			Ref: "#/$defs/" + dnsRuleType.defName,
+		})
+	}
+
+	return oneOfSchemas
+}
+
+// cleanupNestedDefs 清理所有嵌套的 $defs
+func cleanupNestedDefs(schema *jsonschema.Schema) {
+	if schema == nil {
+		return
+	}
+
+	// 递归处理 properties
+	if schema.Properties != nil {
+		for pair := schema.Properties.Oldest(); pair != nil; pair = pair.Next() {
+			cleanupNestedDefs(pair.Value)
+		}
+	}
+
+	// 递归处理 oneOf
+	for _, s := range schema.OneOf {
+		cleanupNestedDefs(s)
+	}
+
+	// 递归处理 anyOf
+	for _, s := range schema.AnyOf {
+		cleanupNestedDefs(s)
+	}
+
+	// 递归处理 allOf
+	for _, s := range schema.AllOf {
+		cleanupNestedDefs(s)
+	}
+
+	// 递归处理 items
+	if schema.Items != nil {
+		cleanupNestedDefs(schema.Items)
+	}
+
+	// 递归处理 $defs 中的每个定义
+	if schema.Definitions != nil {
+		for _, def := range schema.Definitions {
+			// 递归清理子定义中的嵌套 $defs
+			cleanupNestedDefsInDef(def)
+		}
+	}
+}
+
+// cleanupNestedDefsInDef 清理定义中的嵌套 $defs（但不清理顶层 $defs）
+func cleanupNestedDefsInDef(schema *jsonschema.Schema) {
+	if schema == nil {
+		return
+	}
+
+	// 清理当前 schema 的 $defs
+	schema.Definitions = nil
+
+	// 递归处理 properties
+	if schema.Properties != nil {
+		for pair := schema.Properties.Oldest(); pair != nil; pair = pair.Next() {
+			cleanupNestedDefsInDef(pair.Value)
+		}
+	}
+
+	// 递归处理 oneOf/anyOf/allOf
+	for _, s := range schema.OneOf {
+		cleanupNestedDefsInDef(s)
+	}
+	for _, s := range schema.AnyOf {
+		cleanupNestedDefsInDef(s)
+	}
+	for _, s := range schema.AllOf {
+		cleanupNestedDefsInDef(s)
+	}
+
+	// 递归处理 items
+	if schema.Items != nil {
+		cleanupNestedDefsInDef(schema.Items)
+	}
+}
+
+// normalizeDefNames 规范化 $defs 中的名称，移除特殊字符
+func normalizeDefNames(schema *jsonschema.Schema) {
+	if schema.Definitions == nil {
+		return
+	}
+
+	// 构建名称映射：旧名称 -> 新名称
+	nameMapping := make(map[string]string)
+	for name := range schema.Definitions {
+		normalizedName := normalizeDefName(name)
+		if normalizedName != name {
+			nameMapping[name] = normalizedName
+		}
+	}
+
+	// 如果没有需要重命名的，直接返回
+	if len(nameMapping) == 0 {
+		return
+	}
+
+	// 重命名 $defs 中的 key
+	newDefs := make(jsonschema.Definitions)
+	for name, def := range schema.Definitions {
+		newName := name
+		if mapped, ok := nameMapping[name]; ok {
+			newName = mapped
+		}
+		newDefs[newName] = def
+	}
+	schema.Definitions = newDefs
+
+	// 更新所有 $ref 引用
+	updateRefs(schema, nameMapping)
+}
+
+// normalizeDefName 规范化单个定义名称
+func normalizeDefName(name string) string {
+	// 替换特殊字符
+	// Listable[net/netip.Prefix] -> ListableNetipPrefix
+	// Listable[string] -> ListableString
+	// Listable[uint32] -> ListableUint32
+
+	result := name
+
+	// 处理 Listable[xxx] 格式
+	if strings.HasPrefix(result, "Listable[") && strings.HasSuffix(result, "]") {
+		inner := result[9 : len(result)-1] // 提取 [] 中的内容
+
+		// 提取最后一个类型名（去除包路径）
+		// github.com/sagernet/sing-box/option.DNSQueryType -> DNSQueryType
+		// net/netip.Prefix -> Prefix
+		if lastDot := strings.LastIndex(inner, "."); lastDot != -1 {
+			inner = inner[lastDot+1:]
+		} else if lastSlash := strings.LastIndex(inner, "/"); lastSlash != -1 {
+			inner = inner[lastSlash+1:]
+		}
+
+		// 首字母大写
+		if len(inner) > 0 {
+			inner = strings.ToUpper(inner[:1]) + inner[1:]
+		}
+		result = "Listable" + inner
+	}
+
+	// 移除所有特殊字符
+	result = strings.ReplaceAll(result, "[", "")
+	result = strings.ReplaceAll(result, "]", "")
+	result = strings.ReplaceAll(result, "/", "")
+	result = strings.ReplaceAll(result, ".", "")
+	result = strings.ReplaceAll(result, "-", "")
+
+	return result
+}
+
+// updateRefs 递归更新所有 $ref 引用
+func updateRefs(schema *jsonschema.Schema, nameMapping map[string]string) {
+	if schema == nil {
+		return
+	}
+
+	// 更新当前 schema 的 $ref
+	if schema.Ref != "" {
+		for oldName, newName := range nameMapping {
+			oldRef := "#/$defs/" + oldName
+			newRef := "#/$defs/" + newName
+			if schema.Ref == oldRef {
+				schema.Ref = newRef
+				break
+			}
+		}
+	}
+
+	// 递归更新 $defs 中的引用
+	if schema.Definitions != nil {
+		for _, def := range schema.Definitions {
+			updateRefs(def, nameMapping)
+		}
+	}
+
+	// 递归更新 properties
+	if schema.Properties != nil {
+		for pair := schema.Properties.Oldest(); pair != nil; pair = pair.Next() {
+			updateRefs(pair.Value, nameMapping)
+		}
+	}
+
+	// 递归更新 oneOf/anyOf/allOf
+	for _, s := range schema.OneOf {
+		updateRefs(s, nameMapping)
+	}
+	for _, s := range schema.AnyOf {
+		updateRefs(s, nameMapping)
+	}
+	for _, s := range schema.AllOf {
+		updateRefs(s, nameMapping)
+	}
+
+	// 递归更新 items
+	if schema.Items != nil {
+		updateRefs(schema.Items, nameMapping)
+	}
+
+	// 递归更新 additionalProperties
+	if schema.AdditionalProperties != nil {
+		updateRefs(schema.AdditionalProperties, nameMapping)
+	}
 }
 
 // getInboundTypeMapping 通过反射动态获取 inbound 类型映射关系
@@ -252,7 +636,7 @@ func getInboundTypeMapping() map[string]string {
 
 		// 获取返回值的指针并验证
 		optionsValue := reflect.ValueOf(rawOptions)
-		if optionsValue.Kind() == reflect.Ptr {
+		if optionsValue.Kind() == reflect.Pointer {
 			optionsPtr := optionsValue.Pointer()
 
 			// 查找这个指针对应的字段
@@ -356,93 +740,6 @@ func getTypeNameVariants(fieldName string) []string {
 	return variants
 }
 
-// generateOutboundSchema 为所有 outbound 类型生成 oneOf schema
-func generateOutboundSchema(reflector *jsonschema.Reflector) []*jsonschema.Schema {
-	var schemas []*jsonschema.Schema
-
-	// 使用反射动态获取类型映射关系
-	typeMapping := getOutboundTypeMapping()
-
-	// 使用反射获取 _Outbound 结构体的所有字段
-	outboundStructType := reflect.TypeOf((*option.Outbound)(nil)).Elem()
-
-	// 特殊处理：没有选项的类型（通过检查 RawOptions() 返回 nil 来识别）
-	noOptionsTypes := []string{
-		constant.TypeBlock,
-		constant.TypeDNS,
-	}
-
-	// 先添加没有选项的类型
-	for _, typeName := range noOptionsTypes {
-		props := jsonschema.NewProperties()
-		props.Set("type", &jsonschema.Schema{
-			Type:    "string",
-			Const:   typeName,
-			Default: typeName,
-		})
-		props.Set("tag", &jsonschema.Schema{
-			Type: "string",
-		})
-		typeSchema := &jsonschema.Schema{
-			Type:       "object",
-			Properties: props,
-			Required:   []string{"type"},
-		}
-		schemas = append(schemas, typeSchema)
-	}
-
-	// 遍历所有字段（跳过 Type 和 Tag）
-	for i := 0; i < outboundStructType.NumField(); i++ {
-		field := outboundStructType.Field(i)
-		fieldName := field.Name
-
-		// 跳过 Type 和 Tag 字段
-		if fieldName == "Type" || fieldName == "Tag" {
-			continue
-		}
-
-		// 获取类型名称（通过动态映射）
-		typeName, ok := typeMapping[fieldName]
-		if !ok {
-			continue
-		}
-
-		// 获取字段的类型
-		fieldType := field.Type
-
-		// 创建该类型的零值实例
-		fieldValue := reflect.New(fieldType).Interface()
-
-		// 生成 schema
-		typeSchema := reflector.Reflect(fieldValue)
-		// 添加 type 字段的约束
-		typeSchema.Properties.Set("type", &jsonschema.Schema{
-			Type:    "string",
-			Const:   typeName,
-			Default: typeName,
-		})
-		// 确保 type 是必需的
-		if typeSchema.Required == nil {
-			typeSchema.Required = []string{"type"}
-		} else {
-			// 检查是否已包含 type
-			hasType := false
-			for _, req := range typeSchema.Required {
-				if req == "type" {
-					hasType = true
-					break
-				}
-			}
-			if !hasType {
-				typeSchema.Required = append(typeSchema.Required, "type")
-			}
-		}
-		schemas = append(schemas, typeSchema)
-	}
-
-	return schemas
-}
-
 // getOutboundTypeMapping 通过反射动态获取 outbound 类型映射关系
 // 通过遍历所有字段，尝试从字段名推断类型名，然后验证
 func getOutboundTypeMapping() map[string]string {
@@ -519,195 +816,4 @@ func getOutboundTypeMapping() map[string]string {
 	}
 
 	return mapping
-}
-
-// generateRuleSchema 为所有 rule 类型生成 oneOf schema
-func generateRuleSchema(reflector *jsonschema.Reflector) []*jsonschema.Schema {
-	var schemas []*jsonschema.Schema
-
-	// Rule 有两种类型：default 和 logical
-	ruleTypes := []struct {
-		typeName string
-		options  interface{}
-	}{
-		{constant.RuleTypeDefault, &option.DefaultRule{}},
-		{constant.RuleTypeLogical, &option.LogicalRule{}},
-	}
-
-	for _, ruleType := range ruleTypes {
-		typeSchema := reflector.Reflect(ruleType.options)
-		// 添加 type 字段的约束
-		// default 类型的 type 字段可以为空字符串或 "default"
-		if ruleType.typeName == constant.RuleTypeDefault {
-			typeSchema.Properties.Set("type", &jsonschema.Schema{
-				Type: "string",
-				Enum: []interface{}{"", constant.RuleTypeDefault},
-			})
-		} else {
-			typeSchema.Properties.Set("type", &jsonschema.Schema{
-				Type:    "string",
-				Const:   ruleType.typeName,
-				Default: ruleType.typeName,
-			})
-		}
-		schemas = append(schemas, typeSchema)
-	}
-
-	return schemas
-}
-
-// generateRuleSetSchema 为所有 rule_set 类型生成 oneOf schema
-func generateRuleSetSchema(reflector *jsonschema.Reflector) []*jsonschema.Schema {
-	var schemas []*jsonschema.Schema
-
-	// RuleSet 有两种类型：local 和 remote
-	ruleSetTypes := []struct {
-		typeName string
-		options  interface{}
-	}{
-		{constant.RuleSetTypeLocal, &option.LocalRuleSet{}},
-		{constant.RuleSetTypeRemote, &option.RemoteRuleSet{}},
-	}
-
-	for _, ruleSetType := range ruleSetTypes {
-		typeSchema := reflector.Reflect(ruleSetType.options)
-		// 添加 type 字段的约束
-		typeSchema.Properties.Set("type", &jsonschema.Schema{
-			Type:    "string",
-			Const:   ruleSetType.typeName,
-			Default: ruleSetType.typeName,
-		})
-		// RuleSet 需要 tag 和 format 字段
-		typeSchema.Properties.Set("tag", &jsonschema.Schema{
-			Type: "string",
-		})
-		typeSchema.Properties.Set("format", &jsonschema.Schema{
-			Type: "string",
-			Enum: []interface{}{constant.RuleSetFormatSource, constant.RuleSetFormatBinary},
-		})
-		// 确保 type, tag, format 是必需的
-		if typeSchema.Required == nil {
-			typeSchema.Required = []string{"type", "tag", "format"}
-		} else {
-			requiredMap := make(map[string]bool)
-			for _, req := range typeSchema.Required {
-				requiredMap[req] = true
-			}
-			if !requiredMap["type"] {
-				typeSchema.Required = append(typeSchema.Required, "type")
-			}
-			if !requiredMap["tag"] {
-				typeSchema.Required = append(typeSchema.Required, "tag")
-			}
-			if !requiredMap["format"] {
-				typeSchema.Required = append(typeSchema.Required, "format")
-			}
-		}
-		schemas = append(schemas, typeSchema)
-	}
-
-	return schemas
-}
-
-// generateDNSRuleSchema 为所有 dns_rule 类型生成 oneOf schema
-func generateDNSRuleSchema(reflector *jsonschema.Reflector) []*jsonschema.Schema {
-	var schemas []*jsonschema.Schema
-
-	// DNSRule 有两种类型：default 和 logical
-	dnsRuleTypes := []struct {
-		typeName string
-		options  interface{}
-	}{
-		{constant.RuleTypeDefault, &option.DefaultDNSRule{}},
-		{constant.RuleTypeLogical, &option.LogicalDNSRule{}},
-	}
-
-	for _, dnsRuleType := range dnsRuleTypes {
-		typeSchema := reflector.Reflect(dnsRuleType.options)
-		// 添加 type 字段的约束
-		// default 类型的 type 字段可以为空字符串或 "default"
-		if dnsRuleType.typeName == constant.RuleTypeDefault {
-			typeSchema.Properties.Set("type", &jsonschema.Schema{
-				Type: "string",
-				Enum: []interface{}{"", constant.RuleTypeDefault},
-			})
-		} else {
-			typeSchema.Properties.Set("type", &jsonschema.Schema{
-				Type:    "string",
-				Const:   dnsRuleType.typeName,
-				Default: dnsRuleType.typeName,
-			})
-		}
-		schemas = append(schemas, typeSchema)
-	}
-
-	return schemas
-}
-
-// updateSchemaIDs 递归更新 schema 中所有 $id 字段，使其指向我们的 GitHub Pages
-func updateSchemaIDs(schema *jsonschema.Schema, baseURL string) {
-	// 更新当前 schema 的 $id（如果存在且指向 sing-box 仓库）
-	idStr := string(schema.ID)
-	if idStr != "" && strings.Contains(idStr, "github.com/sagernet/sing-box") {
-		// 从原始 $id 中提取类型名称
-		// 例如: https://github.com/sagernet/sing-box/option/direct-outbound-options
-		// 转换为: DirectOutboundOptions (驼峰命名)
-		if strings.Contains(idStr, "/option/") {
-			parts := strings.Split(idStr, "/option/")
-			if len(parts) > 1 {
-				typeNameKebab := parts[1]
-				// 将 kebab-case 转换为 PascalCase
-				// direct-outbound-options -> DirectOutboundOptions
-				typeNameParts := strings.Split(typeNameKebab, "-")
-				var typeNamePascal strings.Builder
-				for _, part := range typeNameParts {
-					if len(part) > 0 {
-						typeNamePascal.WriteString(strings.ToUpper(part[:1]) + part[1:])
-					}
-				}
-				// 指向主 schema 文件，使用片段标识符指向 $defs 中的定义
-				// 这样链接可以点击，并且指向正确的定义
-				schema.ID = jsonschema.ID(baseURL + "/sing-box-config-schema.json#/$defs/" + typeNamePascal.String())
-			}
-		} else {
-			// 其他情况，直接指向主文件
-			schema.ID = jsonschema.ID(baseURL + "/sing-box-config-schema.json")
-		}
-	}
-
-	// 递归更新 $defs 中的所有 schema
-	if schema.Definitions != nil {
-		for _, defSchema := range schema.Definitions {
-			if defSchema != nil {
-				updateSchemaIDs(defSchema, baseURL)
-			}
-		}
-	}
-
-	// 递归更新 oneOf 中的 schema
-	if schema.OneOf != nil {
-		for _, oneOfSchema := range schema.OneOf {
-			if oneOfSchema != nil {
-				updateSchemaIDs(oneOfSchema, baseURL)
-			}
-		}
-	}
-
-	// 递归更新 anyOf 中的 schema
-	if schema.AnyOf != nil {
-		for _, anyOfSchema := range schema.AnyOf {
-			if anyOfSchema != nil {
-				updateSchemaIDs(anyOfSchema, baseURL)
-			}
-		}
-	}
-
-	// 递归更新 allOf 中的 schema
-	if schema.AllOf != nil {
-		for _, allOfSchema := range schema.AllOf {
-			if allOfSchema != nil {
-				updateSchemaIDs(allOfSchema, baseURL)
-			}
-		}
-	}
 }
