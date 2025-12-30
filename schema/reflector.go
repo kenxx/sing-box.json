@@ -2,6 +2,7 @@ package schema
 
 import (
 	"reflect"
+	"slices"
 	"strings"
 )
 
@@ -240,11 +241,5 @@ func parseJSONTag(tag string) (name string, opts []string) {
 
 // containsOption checks if an option is in the list.
 func containsOption(opts []string, option string) bool {
-	for _, opt := range opts {
-		if opt == option {
-			return true
-		}
-	}
-	return false
+	return slices.Contains(opts, option)
 }
-
